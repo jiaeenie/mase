@@ -5,7 +5,6 @@ Fake MXFP quantization operations.
 import torch
 from torch import Tensor
 
-from .._minifloat_mx import extract_minifloat_component, compose_minifloat_component
 from .meta import MXFPMeta
 
 
@@ -13,15 +12,10 @@ def extract_mxfp_components(
     tensor: Tensor, mxfp_meta: MXFPMeta, percentile: float = 1.0
 ) -> tuple[Tensor, Tensor]:
     """
-    Extract MXFP components (scales and elements) from a tensor.
-
-    Args:
-        tensor: Input tensor (already flattened to [n_blocks, block_size])
-        mxfp_meta: MXFP format specification
-        percentile: Percentile for scale calculation (1.0 = max)
-
     Returns:
-        Tuple of (scales_uint8, elements_uint8)
+        scales_uint: uint8, biased shared exponent per block (n_blocks, 1)
+        elements_fp: fp32, denormalized minifloat-quantized values (n_blocks, B)
+                     already divided by 2^shared_exp; compose multiplies it back.
     """
     tensor = tensor.float()
     B = mxfp_meta.block_size
@@ -29,47 +23,48 @@ def extract_mxfp_components(
 
     n_blocks = tensor.numel() // B
 
-    fp32_exp_mask = 0x7F800000
-
-    sc_exp_max = (1 << mxfp_meta.scale_exp_bits) - 1
-    sc_exp_min = 0
     sc_exp_bias = (1 << (mxfp_meta.scale_exp_bits - 1)) - 1
-    sc_exp_max_biased = sc_exp_max - sc_exp_bias
-    sc_exp_min_biased = sc_exp_min - sc_exp_bias
+    sc_exp_max_biased = (1 << mxfp_meta.scale_exp_bits) - 1 - sc_exp_bias
+    sc_exp_min_biased = -sc_exp_bias
 
-    el_exp_max = (
-        (1 << mxfp_meta.element_exp_bits) - 1
-        if mxfp_meta.element_is_finite
-        else (1 << mxfp_meta.element_exp_bits) - 2
-    )
-    el_exp_bias = (1 << (mxfp_meta.element_exp_bits - 1)) - 1
-    el_exp_max_biased = el_exp_max - el_exp_bias
+    E = mxfp_meta.element_exp_bits
+    M = mxfp_meta.element_frac_bits
+    el_exp_bias = (1 << (E - 1)) - 1
+    el_exp_max_biased = (1 << E) - 1 - el_exp_bias
+    el_exp_min_biased = -el_exp_bias
 
-    tensor = tensor.flatten()
-    tensor = tensor.reshape(n_blocks, B)
+    x = tensor.flatten().reshape(n_blocks, B)
 
-    x_int32 = tensor.view(torch.int32)
-    # flush subnormal to zero
-    flush_to_zero = (x_int32 & fp32_exp_mask) == 0
-    tensor = torch.where(flush_to_zero, 0.0, tensor)
-
-    shared_exp = tensor.abs().quantile(percentile, dim=1, keepdim=True)
-
-    shared_exp = shared_exp.log2().floor().to(torch.int32)
-    shared_exp -= el_exp_max_biased
+    # Per-block shared scale: ceil(log2(per-block max)) clamped to scale range.
+    per_block_max = x.abs().quantile(percentile, dim=1, keepdim=True) + 1e-9
+    shared_exp = per_block_max.log2().ceil().to(torch.int32)
     shared_exp = shared_exp.clamp(sc_exp_min_biased, sc_exp_max_biased)
-    scales_uint = shared_exp + sc_exp_bias
-    scales_uint = torch.where(flush_to_zero.all(dim=1, keepdim=True), 0, scales_uint)
-    scales_uint = scales_uint.to(torch.uint8)
 
-    scales_fp = torch.exp2(shared_exp)
+    # Encode shared scale as uint8.
+    scales_uint = (shared_exp + sc_exp_bias).to(torch.uint8)
 
-    minifloats = torch.where(flush_to_zero, 0.0, tensor / scales_fp)
-    elements = extract_minifloat_component(minifloats, mxfp_meta.element_meta)
-    elements = elements.view(torch.uint16)
-    elements = elements.to(torch.uint8)
+    # Normalize tensor by per-block scale; values now have max ~1.0 in magnitude.
+    scales_fp = torch.exp2(shared_exp.float())
+    q_normalized = x / scales_fp
 
-    return scales_uint, elements
+    # Denormalized minifloat quantization (no implicit leading 1).
+    sign = torch.sign(q_normalized + 1e-9)
+    val = q_normalized.abs()
+    el_exp = torch.ceil(torch.log2(val + 1e-9))
+    el_exp = el_exp.clamp(el_exp_min_biased, el_exp_max_biased)
+    mantissa = val / torch.exp2(el_exp)
+    shift = float(1 << M)
+    mantissa_int = (mantissa * shift).round()
+    mantissa_int = mantissa_int.clamp(0, (1 << M) - 1)
+    mantissa_q = mantissa_int / shift
+
+    # Mask: very small values stay zero (avoid spurious tiny artifacts).
+    is_zero = val < 1e-12
+    elements_fp = torch.where(
+        is_zero, torch.zeros_like(q_normalized), sign * torch.exp2(el_exp) * mantissa_q
+    )
+
+    return scales_uint, elements_fp.float()
 
 
 def compose_mxfp_tensor(
@@ -79,26 +74,14 @@ def compose_mxfp_tensor(
     output_dtype: torch.dtype,
 ) -> Tensor:
     """
-    Compose tensor from MXFP components.
-
-    Args:
-        scales: Shared scales (uint8)
-        elements: Quantized elements (uint8)
-        mxfp_meta: MXFP format specification
-        output_dtype: Desired output dtype
-
-    Returns:
-        Dequantized tensor
+    Recompose tensor from (scales_uint8, elements_fp32). Multiplies the
+    minifloat-quantized normalized values by 2^shared_exp.
     """
     assert scales.dtype == torch.uint8
-    assert elements.dtype == torch.uint8
-
     sc_exp_bias = (1 << (mxfp_meta.scale_exp_bits - 1)) - 1
-    scales_fp = torch.exp2(scales.to(torch.int32) - sc_exp_bias)
-    minifloats = compose_minifloat_component(
-        elements.to(torch.uint16), mxfp_meta.element_meta, output_dtype=torch.float32
-    )
+    shared_exp = scales.to(torch.int32) - sc_exp_bias
+    scales_fp = torch.exp2(shared_exp.float())
 
-    dequantized = minifloats * scales_fp
+    dequantized = elements.float() * scales_fp
     dequantized = dequantized.flatten().to(output_dtype)
     return dequantized

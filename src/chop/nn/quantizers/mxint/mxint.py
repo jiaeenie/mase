@@ -110,6 +110,7 @@ def mxint_quantizer_sim(
             )
 
             with torch.no_grad():
+                quant_tensor_dt = quant_tensor.to(act_tensor.dtype)
                 for b in tqdm(
                     range(0, total_batches, BATCH_SIZE),
                     desc="Batching quant output",
@@ -117,12 +118,11 @@ def mxint_quantizer_sim(
                 ):
                     act_b = act_tensor[b : b + BATCH_SIZE]
                     out_orig = torch.matmul(act_b, qtensor.T)
-                    out_q = torch.einsum(
-                        "asb,phb->pash", act_b, quant_tensor.to(act_tensor.dtype)
-                    )
-                    err += torch.norm(out_q - out_orig, p=2, dim=(1, 2))
-
-                    del act_b, out_q, out_orig
+                    for p in range(quant_tensor_dt.shape[0]):
+                        out_q_p = torch.matmul(act_b, quant_tensor_dt[p].T)
+                        err[p] += torch.norm(out_q_p - out_orig, p=2, dim=(0, 1))
+                        del out_q_p
+                    del act_b, out_orig
 
             min_err_idx = torch.argmin(err, dim=0)
             torch.cuda.empty_cache()
